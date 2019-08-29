@@ -3,7 +3,7 @@ extern crate futures;
 extern crate rand;
 extern crate rdkafka;
 
-use futures::Future;
+use futures::executor::block_on;
 
 use rdkafka::producer::FutureProducer;
 use rdkafka::producer::future_producer::FutureRecord;
@@ -34,7 +34,7 @@ fn test_future_producer_send_fail() {
         10000
     );
 
-    match future.wait() {
+    match block_on(future) {
         Ok(Err((kafka_error, owned_message))) => {
             assert_eq!(kafka_error.description(), "Message production error");
             assert_eq!(owned_message.topic(), "topic");

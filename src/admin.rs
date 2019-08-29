@@ -12,14 +12,16 @@ use crate::config::{ClientConfig, FromClientConfig, FromClientConfigAndContext};
 use crate::error::{IsError, KafkaError, KafkaResult};
 use crate::util::{cstr_to_owned, timeout_to_ms, AsCArray, ErrBuf, IntoOpaque, WrappedCPointer};
 
-use futures::future::{self, Either};
-use futures::{Async, Canceled, Complete, Future, Oneshot, Poll};
+use futures::channel::oneshot::{Canceled, Receiver, Sender, channel};
+use futures::future::{self, Either, Future, FutureExt};
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::mem;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -48,17 +50,21 @@ impl<C: ClientContext> AdminClient<C> {
         &self,
         topics: I,
         opts: &AdminOptions,
-    ) -> impl Future<Item = Vec<TopicResult>, Error = KafkaError>
+    ) -> impl Future<Output = KafkaResult<Vec<TopicResult>>>
     where
         I: IntoIterator<Item = &'a NewTopic<'a>>,
     {
         match self.create_topics_inner(topics, opts) {
-            Ok(rx) => Either::A(CreateTopicsFuture { rx }),
-            Err(err) => Either::B(future::err(err)),
+            Ok(rx) => Either::Left(CreateTopicsFuture { rx }),
+            Err(err) => Either::Right(future::err(err)),
         }
     }
 
-    fn create_topics_inner<'a, I>(&self, topics: I, opts: &AdminOptions) -> KafkaResult<Oneshot<NativeEvent>>
+    fn create_topics_inner<'a, I>(
+        &self,
+        topics: I,
+        opts: &AdminOptions,
+    ) -> KafkaResult<Receiver<NativeEvent>>
     where
         I: IntoIterator<Item = &'a NewTopic<'a>>,
     {
@@ -89,19 +95,25 @@ impl<C: ClientContext> AdminClient<C> {
         &self,
         topic_names: &[&str],
         opts: &AdminOptions,
-    ) -> impl Future<Item = Vec<TopicResult>, Error = KafkaError> {
+    ) -> impl Future<Output = KafkaResult<Vec<TopicResult>>> {
         match self.delete_topics_inner(topic_names, opts) {
-            Ok(rx) => Either::A(DeleteTopicsFuture { rx }),
-            Err(err) => Either::B(future::err(err)),
+            Ok(rx) => Either::Left(DeleteTopicsFuture { rx }),
+            Err(err) => Either::Right(future::err(err)),
         }
     }
 
-    fn delete_topics_inner(&self, topic_names: &[&str], opts: &AdminOptions) -> KafkaResult<Oneshot<NativeEvent>> {
+    fn delete_topics_inner(
+        &self,
+        topic_names: &[&str],
+        opts: &AdminOptions,
+    ) -> KafkaResult<Receiver<NativeEvent>> {
         let mut native_topics = Vec::new();
         let mut err_buf = ErrBuf::new();
         for tn in topic_names {
             let tn_c = CString::new(*tn)?;
-            let native_topic = unsafe { NativeDeleteTopic::from_ptr(rdsys::rd_kafka_DeleteTopic_new(tn_c.as_ptr())) };
+            let native_topic = unsafe {
+                NativeDeleteTopic::from_ptr(rdsys::rd_kafka_DeleteTopic_new(tn_c.as_ptr()))
+            };
             native_topics.push(native_topic);
         }
         let (native_opts, rx) = opts.to_native(self.client.native_ptr(), &mut err_buf)?;
@@ -128,17 +140,21 @@ impl<C: ClientContext> AdminClient<C> {
         &self,
         partitions: I,
         opts: &AdminOptions,
-    ) -> impl Future<Item = Vec<TopicResult>, Error = KafkaError>
+    ) -> impl Future<Output = KafkaResult<Vec<TopicResult>>>
     where
         I: IntoIterator<Item = &'a NewPartitions<'a>>,
     {
         match self.create_partitions_inner(partitions, opts) {
-            Ok(rx) => Either::A(CreatePartitionsFuture { rx }),
-            Err(err) => Either::B(future::err(err)),
+            Ok(rx) => Either::Left(CreatePartitionsFuture { rx }),
+            Err(err) => Either::Right(future::err(err)),
         }
     }
 
-    fn create_partitions_inner<'a, I>(&self, partitions: I, opts: &AdminOptions) -> KafkaResult<Oneshot<NativeEvent>>
+    fn create_partitions_inner<'a, I>(
+        &self,
+        partitions: I,
+        opts: &AdminOptions,
+    ) -> KafkaResult<Receiver<NativeEvent>>
     where
         I: IntoIterator<Item = &'a NewPartitions<'a>>,
     {
@@ -169,17 +185,21 @@ impl<C: ClientContext> AdminClient<C> {
         &self,
         configs: I,
         opts: &AdminOptions,
-    ) -> impl Future<Item = Vec<ConfigResourceResult>, Error = KafkaError>
+    ) -> impl Future<Output = KafkaResult<Vec<ConfigResourceResult>>>
     where
         I: IntoIterator<Item = &'a ResourceSpecifier<'a>>,
     {
         match self.describe_configs_inner(configs, opts) {
-            Ok(rx) => Either::A(DescribeConfigsFuture { rx }),
-            Err(err) => Either::B(future::err(err)),
+            Ok(rx) => Either::Left(DescribeConfigsFuture { rx }),
+            Err(err) => Either::Right(future::err(err)),
         }
     }
 
-    fn describe_configs_inner<'a, I>(&self, configs: I, opts: &AdminOptions) -> KafkaResult<Oneshot<NativeEvent>>
+    fn describe_configs_inner<'a, I>(
+        &self,
+        configs: I,
+        opts: &AdminOptions,
+    ) -> KafkaResult<Receiver<NativeEvent>>
     where
         I: IntoIterator<Item = &'a ResourceSpecifier<'a>>,
     {
@@ -187,15 +207,24 @@ impl<C: ClientContext> AdminClient<C> {
         let mut err_buf = ErrBuf::new();
         for c in configs {
             let (name, typ) = match c {
-                ResourceSpecifier::Topic(name) => (CString::new(*name)?, RDKafkaResourceType::RD_KAFKA_RESOURCE_TOPIC),
-                ResourceSpecifier::Group(name) => (CString::new(*name)?, RDKafkaResourceType::RD_KAFKA_RESOURCE_GROUP),
+                ResourceSpecifier::Topic(name) => (
+                    CString::new(*name)?,
+                    RDKafkaResourceType::RD_KAFKA_RESOURCE_TOPIC,
+                ),
+                ResourceSpecifier::Group(name) => (
+                    CString::new(*name)?,
+                    RDKafkaResourceType::RD_KAFKA_RESOURCE_GROUP,
+                ),
                 ResourceSpecifier::Broker(id) => (
                     CString::new(format!("{}", id))?,
                     RDKafkaResourceType::RD_KAFKA_RESOURCE_BROKER,
                 ),
             };
             native_configs.push(unsafe {
-                NativeConfigResource::from_ptr(rdsys::rd_kafka_ConfigResource_new(typ, name.as_ptr()))
+                NativeConfigResource::from_ptr(rdsys::rd_kafka_ConfigResource_new(
+                    typ,
+                    name.as_ptr(),
+                ))
             });
         }
         let (native_opts, rx) = opts.to_native(self.client.native_ptr(), &mut err_buf)?;
@@ -220,17 +249,21 @@ impl<C: ClientContext> AdminClient<C> {
         &self,
         configs: I,
         opts: &AdminOptions,
-    ) -> impl Future<Item = Vec<AlterConfigsResult>, Error = KafkaError>
+    ) -> impl Future<Output = KafkaResult<Vec<AlterConfigsResult>>>
     where
         I: IntoIterator<Item = &'a AlterConfig<'a>>,
     {
         match self.alter_configs_inner(configs, opts) {
-            Ok(rx) => Either::A(AlterConfigsFuture { rx }),
-            Err(err) => Either::B(future::err(err)),
+            Ok(rx) => Either::Left(AlterConfigsFuture { rx }),
+            Err(err) => Either::Right(future::err(err)),
         }
     }
 
-    fn alter_configs_inner<'a, I>(&self, configs: I, opts: &AdminOptions) -> KafkaResult<Oneshot<NativeEvent>>
+    fn alter_configs_inner<'a, I>(
+        &self,
+        configs: I,
+        opts: &AdminOptions,
+    ) -> KafkaResult<Receiver<NativeEvent>>
     where
         I: IntoIterator<Item = &'a AlterConfig<'a>>,
     {
@@ -267,7 +300,12 @@ impl<C: ClientContext> FromClientConfigAndContext<C> for AdminClient<C> {
         // producer, as producer clients are allegedly more lightweight. [0]
         //
         // [0]: https://github.com/confluentinc/confluent-kafka-python/blob/bfb07dfbca47c256c840aaace83d3fe26c587360/confluent_kafka/src/Admin.c#L1492-L1493
-        let client = Client::new(config, native_config, RDKafkaType::RD_KAFKA_PRODUCER, context)?;
+        let client = Client::new(
+            config,
+            native_config,
+            RDKafkaType::RD_KAFKA_PRODUCER,
+            context,
+        )?;
         let queue = Arc::new(client.new_native_queue());
         let should_stop = Arc::new(AtomicBool::new(false));
         let handle = start_poll_thread(queue.clone(), should_stop.clone());
@@ -308,7 +346,7 @@ fn start_poll_thread(queue: Arc<NativeQueue>, should_stop: Arc<AtomicBool>) -> J
                     continue;
                 }
                 let event = unsafe { NativeEvent::from_ptr(event) };
-                let tx: Box<Complete<NativeEvent>> =
+                let tx: Box<Sender<NativeEvent>> =
                     unsafe { IntoOpaque::from_ptr(rdsys::rd_kafka_event_opaque(event.ptr())) };
                 let _ = tx.send(event);
             }
@@ -421,7 +459,7 @@ impl AdminOptions {
         &self,
         client: *mut RDKafka,
         err_buf: &mut ErrBuf,
-    ) -> KafkaResult<(NativeAdminOptions, Oneshot<NativeEvent>)> {
+    ) -> KafkaResult<(NativeAdminOptions, Receiver<NativeEvent>)> {
         let native_opts = unsafe {
             NativeAdminOptions::from_ptr(rdsys::rd_kafka_AdminOptions_new(
                 client,
@@ -477,9 +515,11 @@ impl AdminOptions {
             check_rdkafka_invalid_arg(res, err_buf)?;
         }
 
-        let (tx, rx) = futures::oneshot();
+        let (tx, rx) = channel();
         let tx = Box::new(tx);
-        unsafe { rdsys::rd_kafka_AdminOptions_set_opaque(native_opts.ptr, IntoOpaque::as_ptr(&tx)) };
+        unsafe {
+            rdsys::rd_kafka_AdminOptions_set_opaque(native_opts.ptr, IntoOpaque::as_ptr(&tx))
+        };
         mem::forget(tx);
 
         Ok((native_opts, rx))
@@ -570,7 +610,11 @@ pub struct NewTopic<'a> {
 
 impl<'a> NewTopic<'a> {
     /// Creates a new `NewTopic`.
-    pub fn new(name: &'a str, num_partitions: i32, replication: TopicReplication<'a>) -> NewTopic<'a> {
+    pub fn new(
+        name: &'a str,
+        num_partitions: i32,
+        replication: TopicReplication<'a>,
+    ) -> NewTopic<'a> {
         NewTopic {
             name,
             num_partitions,
@@ -636,7 +680,9 @@ impl<'a> NewTopic<'a> {
         for (key, val) in &self.config {
             let key_c = CString::new(*key)?;
             let val_c = CString::new(*val)?;
-            let res = unsafe { rdsys::rd_kafka_NewTopic_set_config(topic.ptr(), key_c.as_ptr(), val_c.as_ptr()) };
+            let res = unsafe {
+                rdsys::rd_kafka_NewTopic_set_config(topic.ptr(), key_c.as_ptr(), val_c.as_ptr())
+            };
             check_rdkafka_invalid_arg(res, err_buf)?;
         }
         Ok(topic)
@@ -690,31 +736,32 @@ impl Drop for NativeNewTopic {
 }
 
 struct CreateTopicsFuture {
-    rx: Oneshot<NativeEvent>,
+    rx: Receiver<NativeEvent>,
 }
 
 impl Future for CreateTopicsFuture {
-    type Item = Vec<TopicResult>;
-    type Error = KafkaError;
+    type Output = KafkaResult<Vec<TopicResult>>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.rx.poll() {
-            Ok(Async::Ready(event)) => {
-                event.check_error()?;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        match self.rx.poll_unpin(cx) {
+            Poll::Ready(Ok(event)) => {
+                if let Err(e) = event.check_error() {
+                    return Poll::Ready(Err(e));
+                }
                 let res = unsafe { rdsys::rd_kafka_event_CreateTopics_result(event.ptr()) };
                 if res.is_null() {
                     let typ = unsafe { rdsys::rd_kafka_event_type(event.ptr()) };
-                    return Err(KafkaError::AdminOpCreation(format!(
+                    return Poll::Ready(Err(KafkaError::AdminOpCreation(format!(
                         "create topics request received response of incorrect type ({})",
                         typ
-                    )));
+                    ))));
                 }
                 let mut n = 0;
                 let topics = unsafe { rdsys::rd_kafka_CreateTopics_result_topics(res, &mut n) };
-                Ok(Async::Ready(build_topic_results(topics, n)))
+                Poll::Ready(Ok(build_topic_results(topics, n)))
             }
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(Canceled) => Err(KafkaError::Canceled),
+            Poll::Ready(Err(Canceled)) => Poll::Ready(Err(KafkaError::Canceled)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -753,31 +800,32 @@ impl Drop for NativeDeleteTopic {
 }
 
 struct DeleteTopicsFuture {
-    rx: Oneshot<NativeEvent>,
+    rx: Receiver<NativeEvent>,
 }
 
 impl Future for DeleteTopicsFuture {
-    type Item = Vec<TopicResult>;
-    type Error = KafkaError;
+    type Output = KafkaResult<Vec<TopicResult>>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.rx.poll() {
-            Ok(Async::Ready(event)) => {
-                event.check_error()?;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        match self.rx.poll_unpin(cx) {
+            Poll::Ready(Ok(event)) => {
+                if let Err(e) = event.check_error() {
+                    return Poll::Ready(Err(e))
+                };
                 let res = unsafe { rdsys::rd_kafka_event_DeleteTopics_result(event.ptr()) };
                 if res.is_null() {
                     let typ = unsafe { rdsys::rd_kafka_event_type(event.ptr()) };
-                    return Err(KafkaError::AdminOpCreation(format!(
+                    return Poll::Ready(Err(KafkaError::AdminOpCreation(format!(
                         "delete topics request received response of incorrect type ({})",
                         typ
-                    )));
+                    ))));
                 }
                 let mut n = 0;
                 let topics = unsafe { rdsys::rd_kafka_DeleteTopics_result_topics(res, &mut n) };
-                Ok(Async::Ready(build_topic_results(topics, n)))
+                Poll::Ready(Ok(build_topic_results(topics, n)))
             }
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(Canceled) => Err(KafkaError::Canceled),
+            Poll::Ready(Err(Canceled)) => Poll::Ready(Err(KafkaError::Canceled)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -897,31 +945,32 @@ impl Drop for NativeNewPartitions {
 }
 
 struct CreatePartitionsFuture {
-    rx: Oneshot<NativeEvent>,
+    rx: Receiver<NativeEvent>,
 }
 
 impl Future for CreatePartitionsFuture {
-    type Item = Vec<TopicResult>;
-    type Error = KafkaError;
+    type Output = KafkaResult<Vec<TopicResult>>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.rx.poll() {
-            Ok(Async::Ready(event)) => {
-                event.check_error()?;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        match self.rx.poll_unpin(cx) {
+            Poll::Ready(Ok(event)) => {
+                if let Err(e) = event.check_error() {
+                    return Poll::Ready(Err(e));
+                }
                 let res = unsafe { rdsys::rd_kafka_event_CreatePartitions_result(event.ptr()) };
                 if res.is_null() {
                     let typ = unsafe { rdsys::rd_kafka_event_type(event.ptr()) };
-                    return Err(KafkaError::AdminOpCreation(format!(
+                    return Poll::Ready(Err(KafkaError::AdminOpCreation(format!(
                         "create partitions request received response of incorrect type ({})",
                         typ
-                    )));
+                    ))));
                 }
                 let mut n = 0;
                 let topics = unsafe { rdsys::rd_kafka_CreatePartitions_result_topics(res, &mut n) };
-                Ok(Async::Ready(build_topic_results(topics, n)))
+                Poll::Ready(Ok(build_topic_results(topics, n)))
             }
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(Canceled) => Err(KafkaError::Canceled),
+            Poll::Ready(Err(Canceled)) => Poll::Ready(Err(KafkaError::Canceled)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -1044,7 +1093,9 @@ impl Drop for NativeConfigResource {
     }
 }
 
-fn extract_config_specifier(resource: *const RDKafkaConfigResource) -> KafkaResult<OwnedResourceSpecifier> {
+fn extract_config_specifier(
+    resource: *const RDKafkaConfigResource,
+) -> KafkaResult<OwnedResourceSpecifier> {
     let typ = unsafe { rdsys::rd_kafka_ConfigResource_type(resource) };
     match typ {
         RDKafkaResourceType::RD_KAFKA_RESOURCE_TOPIC => {
@@ -1056,7 +1107,8 @@ fn extract_config_specifier(resource: *const RDKafkaConfigResource) -> KafkaResu
             Ok(OwnedResourceSpecifier::Group(name))
         }
         RDKafkaResourceType::RD_KAFKA_RESOURCE_BROKER => {
-            let name = unsafe { CStr::from_ptr(rdsys::rd_kafka_ConfigResource_name(resource)) }.to_string_lossy();
+            let name = unsafe { CStr::from_ptr(rdsys::rd_kafka_ConfigResource_name(resource)) }
+                .to_string_lossy();
             match name.parse::<i32>() {
                 Ok(id) => Ok(OwnedResourceSpecifier::Broker(id)),
                 Err(_) => Err(KafkaError::AdminOpCreation(format!(
@@ -1075,12 +1127,18 @@ fn extract_config_specifier(resource: *const RDKafkaConfigResource) -> KafkaResu
 fn extract_config_source(config_source: RDKafkaConfigSource) -> KafkaResult<ConfigSource> {
     match config_source {
         RDKafkaConfigSource::RD_KAFKA_CONFIG_SOURCE_UNKNOWN_CONFIG => Ok(ConfigSource::Unknown),
-        RDKafkaConfigSource::RD_KAFKA_CONFIG_SOURCE_DYNAMIC_TOPIC_CONFIG => Ok(ConfigSource::DynamicTopic),
-        RDKafkaConfigSource::RD_KAFKA_CONFIG_SOURCE_DYNAMIC_BROKER_CONFIG => Ok(ConfigSource::DynamicBroker),
+        RDKafkaConfigSource::RD_KAFKA_CONFIG_SOURCE_DYNAMIC_TOPIC_CONFIG => {
+            Ok(ConfigSource::DynamicTopic)
+        }
+        RDKafkaConfigSource::RD_KAFKA_CONFIG_SOURCE_DYNAMIC_BROKER_CONFIG => {
+            Ok(ConfigSource::DynamicBroker)
+        }
         RDKafkaConfigSource::RD_KAFKA_CONFIG_SOURCE_DYNAMIC_DEFAULT_BROKER_CONFIG => {
             Ok(ConfigSource::DynamicDefaultBroker)
         }
-        RDKafkaConfigSource::RD_KAFKA_CONFIG_SOURCE_STATIC_BROKER_CONFIG => Ok(ConfigSource::StaticBroker),
+        RDKafkaConfigSource::RD_KAFKA_CONFIG_SOURCE_STATIC_BROKER_CONFIG => {
+            Ok(ConfigSource::StaticBroker)
+        }
         RDKafkaConfigSource::RD_KAFKA_CONFIG_SOURCE_DEFAULT_CONFIG => Ok(ConfigSource::Default),
         _ => Err(KafkaError::AdminOpCreation(format!(
             "bogus config source type in kafka response: {:?}",
@@ -1090,37 +1148,41 @@ fn extract_config_source(config_source: RDKafkaConfigSource) -> KafkaResult<Conf
 }
 
 struct DescribeConfigsFuture {
-    rx: Oneshot<NativeEvent>,
+    rx: Receiver<NativeEvent>,
 }
 
 impl Future for DescribeConfigsFuture {
-    type Item = Vec<ConfigResourceResult>;
-    type Error = KafkaError;
+    type Output = KafkaResult<Vec<ConfigResourceResult>>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.rx.poll() {
-            Ok(Async::Ready(event)) => {
-                event.check_error()?;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        match self.rx.poll_unpin(cx) {
+            Poll::Ready(Ok(event)) => {
+                if let Err(e) = event.check_error() {
+                    return Poll::Ready(Err(e))
+                }
                 let res = unsafe { rdsys::rd_kafka_event_DescribeConfigs_result(event.ptr()) };
                 if res.is_null() {
                     let typ = unsafe { rdsys::rd_kafka_event_type(event.ptr()) };
-                    return Err(KafkaError::AdminOpCreation(format!(
+                    return Poll::Ready(Err(KafkaError::AdminOpCreation(format!(
                         "describe configs request received response of incorrect type ({})",
                         typ
-                    )));
+                    ))));
                 }
                 let mut n = 0;
-                let resources = unsafe { rdsys::rd_kafka_DescribeConfigs_result_resources(res, &mut n) };
+                let resources =
+                    unsafe { rdsys::rd_kafka_DescribeConfigs_result_resources(res, &mut n) };
                 let mut out = Vec::with_capacity(n);
                 for i in 0..n {
                     let resource = unsafe { *resources.offset(i as isize) };
                     let specifier = extract_config_specifier(resource)?;
                     let mut entries_out = Vec::new();
                     let mut n = 0;
-                    let entries = unsafe { rdsys::rd_kafka_ConfigResource_configs(resource, &mut n) };
+                    let entries =
+                        unsafe { rdsys::rd_kafka_ConfigResource_configs(resource, &mut n) };
                     for j in 0..n {
                         let entry = unsafe { *entries.offset(j as isize) };
-                        let name = unsafe { cstr_to_owned(rdsys::rd_kafka_ConfigEntry_name(entry)) };
+                        let name =
+                            unsafe { cstr_to_owned(rdsys::rd_kafka_ConfigEntry_name(entry)) };
                         let value = unsafe {
                             let value = rdsys::rd_kafka_ConfigEntry_value(entry);
                             if value.is_null() {
@@ -1132,10 +1194,17 @@ impl Future for DescribeConfigsFuture {
                         entries_out.push(ConfigEntry {
                             name,
                             value,
-                            source: extract_config_source(unsafe { rdsys::rd_kafka_ConfigEntry_source(entry) })?,
-                            is_read_only: unsafe { rdsys::rd_kafka_ConfigEntry_is_read_only(entry) } != 0,
-                            is_default: unsafe { rdsys::rd_kafka_ConfigEntry_is_default(entry) } != 0,
-                            is_sensitive: unsafe { rdsys::rd_kafka_ConfigEntry_is_sensitive(entry) } != 0,
+                            source: extract_config_source(unsafe {
+                                rdsys::rd_kafka_ConfigEntry_source(entry)
+                            })?,
+                            is_read_only: unsafe {
+                                rdsys::rd_kafka_ConfigEntry_is_read_only(entry)
+                            } != 0,
+                            is_default: unsafe { rdsys::rd_kafka_ConfigEntry_is_default(entry) }
+                                != 0,
+                            is_sensitive: unsafe {
+                                rdsys::rd_kafka_ConfigEntry_is_sensitive(entry)
+                            } != 0,
                         });
                     }
                     out.push(Ok(ConfigResource {
@@ -1143,10 +1212,10 @@ impl Future for DescribeConfigsFuture {
                         entries: entries_out,
                     }))
                 }
-                Ok(Async::Ready(out))
+                Poll::Ready(Ok(out))
             }
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(Canceled) => Err(KafkaError::Canceled),
+            Poll::Ready(Err(Canceled)) => Poll::Ready(Err(KafkaError::Canceled)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -1156,7 +1225,8 @@ impl Future for DescribeConfigsFuture {
 //
 
 /// The result of an individual AlterConfig operation.
-pub type AlterConfigsResult = Result<OwnedResourceSpecifier, (OwnedResourceSpecifier, RDKafkaError)>;
+pub type AlterConfigsResult =
+    Result<OwnedResourceSpecifier, (OwnedResourceSpecifier, RDKafkaError)>;
 
 /// Configuration for an AlterConfig operation.
 pub struct AlterConfig<'a> {
@@ -1183,8 +1253,14 @@ impl<'a> AlterConfig<'a> {
 
     fn to_native(&self, err_buf: &mut ErrBuf) -> KafkaResult<NativeConfigResource> {
         let (name, typ) = match self.specifier {
-            ResourceSpecifier::Topic(name) => (CString::new(name)?, RDKafkaResourceType::RD_KAFKA_RESOURCE_TOPIC),
-            ResourceSpecifier::Group(name) => (CString::new(name)?, RDKafkaResourceType::RD_KAFKA_RESOURCE_GROUP),
+            ResourceSpecifier::Topic(name) => (
+                CString::new(name)?,
+                RDKafkaResourceType::RD_KAFKA_RESOURCE_TOPIC,
+            ),
+            ResourceSpecifier::Group(name) => (
+                CString::new(name)?,
+                RDKafkaResourceType::RD_KAFKA_RESOURCE_GROUP,
+            ),
             ResourceSpecifier::Broker(id) => (
                 CString::new(format!("{}", id))?,
                 RDKafkaResourceType::RD_KAFKA_RESOURCE_BROKER,
@@ -1192,12 +1268,19 @@ impl<'a> AlterConfig<'a> {
         };
         // N.B.: we wrap config immediately, so that it is destroyed via the
         // NativeNewTopic's Drop implementation if config installation fails.
-        let config = unsafe { NativeConfigResource::from_ptr(rdsys::rd_kafka_ConfigResource_new(typ, name.as_ptr())) };
+        let config = unsafe {
+            NativeConfigResource::from_ptr(rdsys::rd_kafka_ConfigResource_new(typ, name.as_ptr()))
+        };
         for (key, val) in &self.entries {
             let key_c = CString::new(*key)?;
             let val_c = CString::new(*val)?;
-            let res =
-                unsafe { rdsys::rd_kafka_ConfigResource_set_config(config.ptr(), key_c.as_ptr(), val_c.as_ptr()) };
+            let res = unsafe {
+                rdsys::rd_kafka_ConfigResource_set_config(
+                    config.ptr(),
+                    key_c.as_ptr(),
+                    val_c.as_ptr(),
+                )
+            };
             check_rdkafka_invalid_arg(res, err_buf)?;
         }
         Ok(config)
@@ -1205,37 +1288,39 @@ impl<'a> AlterConfig<'a> {
 }
 
 struct AlterConfigsFuture {
-    rx: Oneshot<NativeEvent>,
+    rx: Receiver<NativeEvent>,
 }
 
 impl Future for AlterConfigsFuture {
-    type Item = Vec<AlterConfigsResult>;
-    type Error = KafkaError;
+    type Output = KafkaResult<Vec<AlterConfigsResult>>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.rx.poll() {
-            Ok(Async::Ready(event)) => {
-                event.check_error()?;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        match self.rx.poll_unpin(cx) {
+            Poll::Ready(Ok(event)) => {
+                if let Err(e) = event.check_error() {
+                    return Poll::Ready(Err(e))
+                };
                 let res = unsafe { rdsys::rd_kafka_event_AlterConfigs_result(event.ptr()) };
                 if res.is_null() {
                     let typ = unsafe { rdsys::rd_kafka_event_type(event.ptr()) };
-                    return Err(KafkaError::AdminOpCreation(format!(
+                    return Poll::Ready(Err(KafkaError::AdminOpCreation(format!(
                         "alter configs request received response of incorrect type ({})",
                         typ
-                    )));
+                    ))));
                 }
                 let mut n = 0;
-                let resources = unsafe { rdsys::rd_kafka_AlterConfigs_result_resources(res, &mut n) };
+                let resources =
+                    unsafe { rdsys::rd_kafka_AlterConfigs_result_resources(res, &mut n) };
                 let mut out = Vec::with_capacity(n);
                 for i in 0..n {
                     let resource = unsafe { *resources.offset(i as isize) };
                     let specifier = extract_config_specifier(resource)?;
                     out.push(Ok(specifier));
                 }
-                Ok(Async::Ready(out))
+                Poll::Ready(Ok(out))
             }
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(Canceled) => Err(KafkaError::Canceled),
+            Poll::Ready(Err(Canceled)) => Poll::Ready(Err(KafkaError::Canceled)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }

@@ -76,7 +76,9 @@ impl fmt::Debug for KafkaError {
             KafkaError::AdminOp(err) => write!(f, "KafkaError (Admin operation error: {})", err),
             KafkaError::AdminOpCreation(ref err) => write!(f, "KafkaError (Admin operation creation error: {})", err),
             KafkaError::Canceled => write!(f, "KafkaError (Client dropped)"),
-            KafkaError::ClientConfig(_, ref desc, ref key, ref value) => write!(f, "KafkaError (Client config error: {} {} {})", desc, key, value),
+            KafkaError::ClientConfig(_, ref desc, ref key, ref value) => {
+                write!(f, "KafkaError (Client config error: {} {} {})", desc, key, value)
+            }
             KafkaError::ClientCreation(ref err) => write!(f, "KafkaError (Client creation error: {})", err),
             KafkaError::ConsumerCommit(err) => write!(f, "KafkaError (Consumer commit error: {})", err),
             KafkaError::Global(err) => write!(f, "KafkaError (Global error: {})", err),
@@ -101,7 +103,9 @@ impl fmt::Display for KafkaError {
             KafkaError::AdminOp(err) => write!(f, "Admin operation error: {}", err),
             KafkaError::AdminOpCreation(ref err) => write!(f, "Admin operation creation error: {}", err),
             KafkaError::Canceled => write!(f, "KafkaError (Client dropped)"),
-            KafkaError::ClientConfig(_, ref desc, ref key, ref value) => write!(f, "Client config error: {} {} {}", desc, key, value),
+            KafkaError::ClientConfig(_, ref desc, ref key, ref value) => {
+                write!(f, "Client config error: {} {} {}", desc, key, value)
+            }
             KafkaError::ClientCreation(ref err) => write!(f, "Client creation error: {}", err),
             KafkaError::ConsumerCommit(err) => write!(f, "Consumer commit error: {}", err),
             KafkaError::Global(err) => write!(f, "Global error: {}", err),
@@ -145,7 +149,7 @@ impl error::Error for KafkaError {
     }
 
     #[allow(clippy::match_same_arms)]
-    fn cause(&self) -> Option<&error::Error> {
+    fn cause(&self) -> Option<&dyn error::Error> {
         match *self {
             KafkaError::AdminOp(_) => None,
             KafkaError::AdminOpCreation(_) => None,

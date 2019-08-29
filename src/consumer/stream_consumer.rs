@@ -1,22 +1,24 @@
 //! Stream-based consumer implementation.
-use futures::{Future, Poll, Sink, Stream};
-use futures::sync::mpsc;
-use crate::rdsys::types::*;
 use crate::rdsys;
+use crate::rdsys::types::*;
+use futures::channel::mpsc;
+use futures::executor::block_on;
+use futures::{Poll, SinkExt, Stream, StreamExt};
 
-use crate::config::{FromClientConfig, FromClientConfigAndContext, ClientConfig};
+use crate::config::{ClientConfig, FromClientConfig, FromClientConfigAndContext};
 use crate::consumer::base_consumer::BaseConsumer;
 use crate::consumer::{Consumer, ConsumerContext, DefaultConsumerContext};
 use crate::error::{KafkaError, KafkaResult};
 use crate::message::BorrowedMessage;
 use crate::util::duration_to_millis;
 
+use std::pin::Pin;
 use std::ptr;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::Context;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-
 
 /// Default channel size for the stream consumer. The number of context switches
 /// seems to decrease exponentially as the channel size is increased, and it stabilizes when
@@ -44,7 +46,10 @@ impl PolledMessagePtr {
     /// Transforms the `PolledMessagePtr` into a message whose lifetime will be bound to the
     /// lifetime of the provided consumer. If the librdkafka message represents an error, the error
     /// will be returned instead.
-    fn into_message_of<C: ConsumerContext>(mut self, consumer: &StreamConsumer<C>) -> KafkaResult<BorrowedMessage> {
+    fn into_message_of<C: ConsumerContext>(
+        mut self,
+        consumer: &StreamConsumer<C>,
+    ) -> KafkaResult<BorrowedMessage> {
         let msg = unsafe { BorrowedMessage::from_consumer(self.message_ptr, consumer) };
         self.message_ptr = ptr::null_mut();
         msg
@@ -78,29 +83,34 @@ pub struct MessageStream<'a, C: ConsumerContext + 'static> {
 }
 
 impl<'a, C: ConsumerContext + 'static> MessageStream<'a, C> {
-    fn new(consumer: &'a StreamConsumer<C>, receiver: mpsc::Receiver<Option<PolledMessagePtr>>) -> MessageStream<'a, C> {
+    fn new(
+        consumer: &'a StreamConsumer<C>,
+        receiver: mpsc::Receiver<Option<PolledMessagePtr>>,
+    ) -> MessageStream<'a, C> {
         MessageStream { consumer, receiver }
     }
 }
 
 impl<'a, C: ConsumerContext + 'a> Stream for MessageStream<'a, C> {
     type Item = KafkaResult<BorrowedMessage<'a>>;
-    type Error = ();
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        self.receiver.poll()
-            .map(|ready|
-                ready.map(|option|
-                    option.map(|polled_ptr_opt|
-                        polled_ptr_opt.map_or(
-                            Err(KafkaError::NoMessageReceived),
-                            |polled_ptr| polled_ptr.into_message_of(self.consumer)))))
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        self.receiver
+            .poll_next_unpin(cx)
+            .map(|ready: Option<Option<PolledMessagePtr>>| {
+                ready.map(|polled_ptr_opt: Option<PolledMessagePtr>| {
+                    polled_ptr_opt.map_or(
+                        Err(KafkaError::NoMessageReceived),
+                        |polled_ptr: PolledMessagePtr| polled_ptr.into_message_of(self.consumer),
+                    )
+                })
+            })
     }
 }
 
 /// Internal consumer loop. This is the main body of the thread that will drive the stream consumer.
 /// If `send_none` is true, the loop will send a None into the sender every time the poll times out.
-fn poll_loop<C: ConsumerContext>(
+async fn poll_loop<C: ConsumerContext>(
     consumer: &BaseConsumer<C>,
     sender: mpsc::Sender<Option<PolledMessagePtr>>,
     should_stop: &AtomicBool,
@@ -117,13 +127,13 @@ fn poll_loop<C: ConsumerContext>(
                 if send_none {
                     curr_sender.send(None)
                 } else {
-                    continue // TODO: check stream closed
+                    continue; // TODO: check stream closed
                 }
-            },
+            }
             Some(m_ptr) => curr_sender.send(Some(PolledMessagePtr::new(m_ptr))),
         };
-        match future_sender.wait() {
-            Ok(new_sender) => curr_sender = new_sender,
+        match future_sender.await {
+            Ok(_) => {},
             Err(e) => {
                 debug!("Sender not available: {:?}", e);
                 break;
@@ -161,7 +171,10 @@ impl FromClientConfig for StreamConsumer {
 
 /// Creates a new `StreamConsumer` starting from a `ClientConfig`.
 impl<C: ConsumerContext> FromClientConfigAndContext<C> for StreamConsumer<C> {
-    fn from_config_and_context(config: &ClientConfig, context: C) -> KafkaResult<StreamConsumer<C>> {
+    fn from_config_and_context(
+        config: &ClientConfig,
+        context: C,
+    ) -> KafkaResult<StreamConsumer<C>> {
         let stream_consumer = StreamConsumer {
             consumer: Arc::new(BaseConsumer::from_config_and_context(config, context)?),
             should_stop: Arc::new(AtomicBool::new(false)),
@@ -190,7 +203,13 @@ impl<C: ConsumerContext> StreamConsumer<C> {
         let handle = thread::Builder::new()
             .name("poll".to_string())
             .spawn(move || {
-                poll_loop(consumer.as_ref(), sender, should_stop.as_ref(), poll_interval, no_message_error);
+                block_on(poll_loop(
+                    consumer.as_ref(),
+                    sender,
+                    should_stop.as_ref(),
+                    poll_interval,
+                    no_message_error,
+                ));
             })
             .expect("Failed to start polling thread");
         *self.handle.lock().unwrap() = Some(handle);
@@ -219,4 +238,3 @@ impl<C: ConsumerContext> Drop for StreamConsumer<C> {
         self.stop();
     }
 }
-
